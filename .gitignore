@@ -6,6 +6,9 @@ dist/
 __pycache__/
 backups/
 profiles/
+.integrity
+.license
+license_mgr.py
 .vs/
 node_modules/
 src/

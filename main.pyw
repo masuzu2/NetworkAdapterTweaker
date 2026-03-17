@@ -920,4 +920,15 @@ if __name__ == "__main__":
         try: B.run_as_admin()
         except: pass
         sys.exit(0)
-    App().run()
+
+    # ── Anti-Crack Guard ──
+    import guard
+    guard.init()
+    guard.start_heartbeat()
+
+    app = App()
+
+    # Post-freeze protection (scramble bytecode after everything loaded)
+    app.root.after(2000, guard.apply_post_freeze)
+
+    app.run()
