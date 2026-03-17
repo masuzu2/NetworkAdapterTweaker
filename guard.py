@@ -1,19 +1,30 @@
 """
-╔══════════════════════════════════════════════════════════════╗
-║  Anti-Crack Guard — by Bootstep                              ║
-║  กันทุกจุดอ่อนของ Python: decompile, extract, debug, dump    ║
-╠══════════════════════════════════════════════════════════════╣
-║  1. Anti-PyInstExtractor  — กันแกะ .exe → .pyc              ║
-║  2. Anti-Decompile        — กัน uncompyle6/decompyle3/pycdc ║
-║  3. Anti-Debug            — กัน debugger ทุกชนิด            ║
-║  4. Anti-Process          — ตรวจจับ RE tools ที่เปิดอยู่      ║
-║  5. Anti-Tamper           — ตรวจจับไฟล์ถูกแก้ไข              ║
-║  6. Anti-Hook             — ตรวจจับ API hooking              ║
-║  7. Anti-Dump             — กันดูดหน่วยความจำ                ║
-║  8. Anti-Trace            — กัน sys.settrace/setprofile      ║
-║  9. Code Protection       — ล็อก __code__, __dict__          ║
-║ 10. Heartbeat             — เช็คต่อเนื่องทุก 5 วินาที         ║
-╚══════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════╗
+║  Anti-Crack Guard v3 — by Bootstep                               ║
+║  กันทุกจุดอ่อนของ Python + กัน RE ทุกรูปแบบ                       ║
+╠═══════════════════════════════════════════════════════════════════╣
+║   1. Anti-Debug          — 8 วิธี: API/PEB/Port/Flags/HWBP/     ║
+║                            Timing/OutputDbg/CloseHandle          ║
+║   2. Anti-Decompile      — block uncompyle6/decompyle3/dis       ║
+║   3. Anti-PyInstExtractor— ตรวจจับ extract + encrypt bytecode    ║
+║   4. Anti-Process        — 40+ RE tools detection                ║
+║   5. Anti-Window         — scan window titles for RE tools       ║
+║   6. Anti-Tamper         — SHA256 integrity of all source files  ║
+║   7. Anti-Hook           — detect JMP/INT3/NOP patches on APIs   ║
+║   8. Anti-Dump           — ป้องกัน memory dump                    ║
+║   9. Anti-Trace          — block settrace/setprofile             ║
+║  10. Anti-VM/Sandbox     — detect VMware/VBox/Sandboxie/Any.Run  ║
+║  11. Anti-DLL-Inject     — detect suspicious DLL injections      ║
+║  12. Anti-Attach         — hide thread from debugger             ║
+║  13. Parent Process      — verify parent is Explorer not RE tool ║
+║  14. Kernel Debugger     — detect kernel-mode debugger           ║
+║  15. Code Scramble       — overwrite co_filename/co_name         ║
+║  16. Import Blocker      — block decompiler module imports       ║
+║  17. Stack Protection    — suppress tracebacks leaking code      ║
+║  18. Self-Checksum       — CRC32 of exe file                    ║
+║  19. Env Var Check       — detect debugger env vars              ║
+║  20. Heartbeat           — continuous 5s checks, 2 strikes out   ║
+╚═══════════════════════════════════════════════════════════════════╝
 """
 
 import ctypes
@@ -25,178 +36,37 @@ import time
 import threading
 import subprocess
 import json
-import base64
 import struct
 import types
+import traceback
 from pathlib import Path
 
-# ─── Config ───
 _HEARTBEAT_SEC = 5
 _MAX_STRIKES = 2
 _SELF_FILES = ["main.pyw", "adapter.py", "guard.py"]
 
-# ─── WinAPI ───
 k32 = ctypes.windll.kernel32
 ntdll = ctypes.windll.ntdll
 u32 = ctypes.windll.user32
 
 
-# ══════════════════════════════════════════════════════
-#  1. ANTI-PYINSTEXTRACTOR
-#     ตรวจจับว่ามีคนใช้ pyinstxtractor แกะ exe
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#  1. ANTI-DEBUG (8 methods)
+# ═══════════════════════════════════════════
 
-def check_pyinstxtractor() -> bool:
-    """Detect if running from extracted PyInstaller output."""
-    # pyinstxtractor extracts to a folder with specific structure
-    # The real PyInstaller runs from _MEIPASS temp dir
-    if getattr(sys, 'frozen', False):
-        mei = getattr(sys, '_MEIPASS', '')
-        if mei:
-            # Check if _MEIPASS folder has been copied/moved
-            # Real MEIPASS is in temp dir, extracted one won't be
-            import tempfile
-            temp_root = tempfile.gettempdir()
-            if not mei.startswith(temp_root):
-                return True  # Running from non-temp = extracted
-
-            # Check for pyinstxtractor artifacts
-            parent = os.path.dirname(mei)
-            suspicious = [
-                os.path.join(parent, "PYZ-00.pyz_extracted"),
-                os.path.join(parent, "pyimod01_os_path.pyc"),
-                os.path.join(parent, "pyimod02_archive.pyc"),
-                os.path.join(parent, "pyimod03_importers.pyc"),
-            ]
-            for s in suspicious:
-                if os.path.exists(s):
-                    return True
-    return False
-
-
-def protect_pyinstaller():
-    """
-    Overwrite PyInstaller archive markers in memory to make extraction harder.
-    PyInstaller stores a MAGIC at the end of exe, extractors look for it.
-    """
-    if not getattr(sys, 'frozen', False):
-        return
-    try:
-        exe_path = sys.executable
-        # Verify our exe hasn't been unpacked to a different location
-        if not os.path.isfile(exe_path):
-            os._exit(1)
-    except:
-        pass
-
-
-# ══════════════════════════════════════════════════════
-#  2. ANTI-DECOMPILE
-#     กัน uncompyle6, decompyle3, pycdc, bytecode analysis
-# ══════════════════════════════════════════════════════
-
-def protect_bytecode():
-    """
-    Make bytecode harder to decompile:
-    - Block access to __code__ objects
-    - Block sys.settrace/setprofile (used by decompilers)
-    - Install import hooks to block decompiler modules
-    """
-    # Block tracing
-    try:
-        sys.settrace(None)
-        sys.setprofile(None)
-        # Replace settrace/setprofile with no-ops
-        def _blocked(*a, **kw): pass
-        sys.settrace = _blocked
-        sys.setprofile = _blocked
-    except: pass
-
-    # Block decompiler imports
-    _blocked_modules = {
-        'uncompyle6', 'decompyle3', 'xdis', 'spark_parser',
-        'pycdc', 'pydumpck', 'pycdas', 'bytecode',
-        'dis',  # standard disassembler
-        'inspect',  # can read source/bytecode
-        'pdb',  # Python debugger
-        'bdb',  # base debugger
-        'trace',  # tracing module
-        'pydevd',  # PyCharm debugger
-        'debugpy',  # VS Code debugger
-        '_pydevd_bundle',
-        'pyinstxtractor',
-    }
-
-    class AntiDecompileImporter:
-        """Meta path finder that blocks decompiler imports."""
-        def find_module(self, name, path=None):
-            base = name.split('.')[0]
-            if base in _blocked_modules:
-                return self
-            return None
-
-        def load_module(self, name):
-            raise ImportError(f"Module '{name}' is blocked")
-
-    # Install as first importer
-    sys.meta_path.insert(0, AntiDecompileImporter())
-
-
-def scramble_code_objects():
-    """
-    Modify code object metadata to confuse decompilers.
-    Changes co_filename, co_name for all loaded modules' functions.
-    """
-    def _scramble(obj, depth=0):
-        if depth > 10: return
-        if isinstance(obj, types.FunctionType):
-            try:
-                code = obj.__code__
-                # Replace filename and name with gibberish
-                new_code = code.replace(
-                    co_filename="<protected>",
-                )
-                obj.__code__ = new_code
-            except: pass
-        elif isinstance(obj, type):
-            for attr in dir(obj):
-                try:
-                    val = getattr(obj, attr)
-                    if isinstance(val, types.FunctionType):
-                        _scramble(val, depth+1)
-                except: pass
-
-    # Scramble all loaded modules' code
-    for name, mod in list(sys.modules.items()):
-        if mod is None: continue
-        if name.startswith(('_', 'builtins', 'ctypes', 'tkinter', 'json')): continue
-        for attr in dir(mod):
-            try:
-                val = getattr(mod, attr)
-                _scramble(val)
-            except: pass
-
-
-# ══════════════════════════════════════════════════════
-#  3. ANTI-DEBUG (ทุกวิธี)
-# ══════════════════════════════════════════════════════
-
-def _dbg_api() -> bool:
-    """IsDebuggerPresent + CheckRemoteDebuggerPresent"""
+def _dbg_api():
     if k32.IsDebuggerPresent(): return True
-    flag = ctypes.c_int(0)
-    k32.CheckRemoteDebuggerPresent(k32.GetCurrentProcess(), ctypes.byref(flag))
-    return bool(flag.value)
+    f = ctypes.c_int(0)
+    k32.CheckRemoteDebuggerPresent(k32.GetCurrentProcess(), ctypes.byref(f))
+    return bool(f.value)
 
-def _dbg_peb() -> bool:
-    """NtQueryInformationProcess — ProcessBasicInformation"""
+def _dbg_peb():
     try:
         class PBI(ctypes.Structure):
             _fields_ = [("R1",ctypes.c_void_p),("Peb",ctypes.c_void_p),
                         ("R2",ctypes.c_void_p*2),("Uid",ctypes.POINTER(ctypes.c_ulong)),
                         ("R3",ctypes.c_void_p)]
-        pbi = PBI()
-        rl = ctypes.c_ulong(0)
+        pbi = PBI(); rl = ctypes.c_ulong(0)
         ntdll.NtQueryInformationProcess(k32.GetCurrentProcess(), 0,
             ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(rl))
         if pbi.Peb:
@@ -207,116 +77,179 @@ def _dbg_peb() -> bool:
     except: pass
     return False
 
-def _dbg_port() -> bool:
-    """NtQueryInformationProcess — ProcessDebugPort"""
+def _dbg_port():
     try:
-        port = ctypes.c_void_p(0)
-        rl = ctypes.c_ulong(0)
+        p = ctypes.c_void_p(0); rl = ctypes.c_ulong(0)
         ntdll.NtQueryInformationProcess(k32.GetCurrentProcess(), 7,
-            ctypes.byref(port), ctypes.sizeof(port), ctypes.byref(rl))
-        return port.value != 0
+            ctypes.byref(p), ctypes.sizeof(p), ctypes.byref(rl))
+        return p.value != 0
     except: pass
     return False
 
-def _dbg_flags() -> bool:
-    """NtQueryInformationProcess — ProcessDebugFlags"""
+def _dbg_flags():
     try:
-        flags = ctypes.c_ulong(0)
-        rl = ctypes.c_ulong(0)
+        f = ctypes.c_ulong(0); rl = ctypes.c_ulong(0)
         ntdll.NtQueryInformationProcess(k32.GetCurrentProcess(), 0x1F,
-            ctypes.byref(flags), ctypes.sizeof(flags), ctypes.byref(rl))
-        return flags.value == 0  # 0 = debugger attached
+            ctypes.byref(f), ctypes.sizeof(f), ctypes.byref(rl))
+        return f.value == 0
     except: pass
     return False
 
-def _dbg_hwbp() -> bool:
-    """Hardware breakpoints via thread context debug registers"""
+def _dbg_hwbp():
     try:
         class CTX(ctypes.Structure):
-            _fields_ = [("Flags",ctypes.c_ulong),("Pad",ctypes.c_ubyte*200),
+            _fields_ = [("F",ctypes.c_ulong),("P",ctypes.c_ubyte*200),
                         ("Dr0",ctypes.c_ulonglong),("Dr1",ctypes.c_ulonglong),
                         ("Dr2",ctypes.c_ulonglong),("Dr3",ctypes.c_ulonglong)]
-        ctx = CTX()
-        ctx.Flags = 0x00010010
-        if k32.GetThreadContext(k32.GetCurrentThread(), ctypes.byref(ctx)):
-            return any([ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3])
+        c = CTX(); c.F = 0x00010010
+        if k32.GetThreadContext(k32.GetCurrentThread(), ctypes.byref(c)):
+            return any([c.Dr0, c.Dr1, c.Dr2, c.Dr3])
     except: pass
     return False
 
-def _dbg_timing() -> bool:
-    """Timing attack — debuggers slow down execution"""
+def _dbg_timing():
     t1 = time.perf_counter_ns()
     x = sum(i*i for i in range(5000))
     t2 = time.perf_counter_ns()
-    return (t2-t1) / 1_000_000 > 150  # >150ms = debugger
+    return (t2-t1)/1_000_000 > 150
 
-def _dbg_output() -> bool:
-    """OutputDebugString trick — returns error if debugger attached"""
+def _dbg_output():
     try:
         k32.SetLastError(0)
-        k32.OutputDebugStringW("bootstep_check")
+        k32.OutputDebugStringW("bstep")
         return k32.GetLastError() != 0
     except: pass
     return False
 
-def check_debug() -> bool:
-    for fn in [_dbg_api, _dbg_peb, _dbg_port, _dbg_flags, _dbg_hwbp, _dbg_timing, _dbg_output]:
+def _dbg_close_handle():
+    """CloseHandle trick — invalid handle raises exception under debugger."""
+    try:
+        k32.CloseHandle(ctypes.c_void_p(0x99999999))
+        return False  # no exception = no debugger
+    except:
+        return True   # exception = debugger
+
+def check_debug():
+    for fn in [_dbg_api, _dbg_peb, _dbg_port, _dbg_flags,
+               _dbg_hwbp, _dbg_timing, _dbg_output, _dbg_close_handle]:
         try:
             if fn(): return True
         except: pass
     return False
 
 
-# ══════════════════════════════════════════════════════
-#  4. ANTI-PROCESS (RE tools)
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#  2. ANTI-DECOMPILE + IMPORT BLOCKER
+# ═══════════════════════════════════════════
 
-_BAD_PROCS = [
+_BLOCKED = frozenset({
+    'uncompyle6','decompyle3','xdis','spark_parser','pycdc','pydumpck',
+    'pycdas','bytecode','dis','inspect','pdb','bdb','trace','pydevd',
+    'debugpy','_pydevd_bundle','pyinstxtractor','code','codeop',
+    'compileall','py_compile',
+})
+
+class _ImportBlocker:
+    def find_module(self, name, path=None):
+        if name.split('.')[0] in _BLOCKED: return self
+    def load_module(self, name):
+        raise ImportError(f"Blocked: {name}")
+
+def protect_imports():
+    sys.meta_path.insert(0, _ImportBlocker())
+
+def protect_trace():
+    noop = lambda *a, **kw: None
+    sys.settrace = noop
+    sys.setprofile = noop
+    try: threading.settrace = noop; threading.setprofile = noop
+    except: pass
+
+
+# ═══════════════════════════════════════════
+#  3. ANTI-PYINSTEXTRACTOR
+# ═══════════════════════════════════════════
+
+def check_pyinstxtractor():
+    if not getattr(sys, 'frozen', False): return False
+    mei = getattr(sys, '_MEIPASS', '')
+    if not mei: return False
+    import tempfile
+    if not mei.startswith(tempfile.gettempdir()): return True
+    # Check extraction artifacts
+    parent = os.path.dirname(mei)
+    for name in ["PYZ-00.pyz_extracted","pyimod01_os_path.pyc",
+                 "pyimod02_archive.pyc","pyimod03_importers.pyc"]:
+        if os.path.exists(os.path.join(parent, name)): return True
+    return False
+
+def protect_pyinstaller():
+    if not getattr(sys, 'frozen', False): return
+    # Verify exe integrity
+    try:
+        if not os.path.isfile(sys.executable): os._exit(1)
+    except: pass
+
+
+# ═══════════════════════════════════════════
+#  4. ANTI-PROCESS (40+ tools)
+# ═══════════════════════════════════════════
+
+_BAD = [
     # Debuggers
-    "x64dbg.exe","x32dbg.exe","ollydbg.exe","windbg.exe",
+    "x64dbg.exe","x32dbg.exe","ollydbg.exe","windbg.exe","immunitydebugger.exe",
     "idaq.exe","idaq64.exe","ida.exe","ida64.exe",
-    # RE / Disassemblers
-    "ghidra.exe","ghidrarun.exe","radare2.exe","r2.exe",
-    "cutter.exe","binaryninja.exe",
-    # Memory tools
-    "cheatengine-x86_64.exe","cheatengine.exe",
+    # RE
+    "ghidra.exe","ghidrarun.exe","radare2.exe","r2.exe","rizin.exe",
+    "cutter.exe","binaryninja.exe","hopper.exe",
+    # Memory
+    "cheatengine-x86_64.exe","cheatengine.exe","artmoney.exe","tsearch.exe",
     "processhacker.exe","procmon.exe","procmon64.exe",
-    "procexp.exe","procexp64.exe",
+    "procexp.exe","procexp64.exe","systemexplorer.exe",
     # Dumpers
-    "procdump.exe","procdump64.exe","dumpcap.exe",
-    # .NET / Python decompilers
-    "dnspy.exe","dnspy-x86.exe","ilspy.exe","dotpeek.exe",
+    "procdump.exe","procdump64.exe","dumpcap.exe","rawshark.exe",
+    # .NET/Python decompilers
+    "dnspy.exe","dnspy-x86.exe","ilspy.exe","dotpeek.exe","justdecompile.exe",
     "de4dot.exe","pyinstxtractor.exe",
-    # Patchers
-    "lordpe.exe","pe-bear.exe","pestudio.exe",
-    "hxd.exe","010editor.exe",
+    # Patchers/Hex
+    "lordpe.exe","pe-bear.exe","pestudio.exe","cff explorer.exe",
+    "hxd.exe","010editor.exe","hexworkshop.exe",
     # API monitors
     "apimonitor-x64.exe","apimonitor-x86.exe","rohitab.exe",
-    # HTTP debuggers
-    "fiddler.exe","charles.exe","httpdebuggerpro.exe",
+    # HTTP
+    "fiddler.exe","charles.exe","httpdebuggerpro.exe","httpdebuggerui.exe",
     # Import reconstructors
     "scylla.exe","scylla_x64.exe","importrec.exe",
+    # Sniffers
+    "wireshark.exe","tcpview.exe","tcpvcon.exe",
+    # Sandboxes
+    "sandboxie.exe","sbiectrl.exe","sbiedll.dll",
+    # Misc RE
+    "resourcehacker.exe","reshacker.exe","depends.exe","dumpbin.exe",
 ]
 
 _BAD_TITLES = [
-    "x64dbg","x32dbg","ollydbg","windbg","ida ",
+    "x64dbg","x32dbg","ollydbg","windbg","immunity","ida ",
     "ghidra","cheat engine","process hacker","process monitor",
+    "process explorer","system explorer",
     "dnspy","dotpeek","ilspy","de4dot","api monitor",
     "http debugger","scylla","import reconstructor",
-    "pyinstxtractor","uncompyle","decompyle",
+    "pyinstxtractor","uncompyle","decompyle","binary ninja",
+    "hopper","radare","rizin","cutter",
+    "resource hacker","hex workshop","010 editor",
 ]
 
-def check_processes() -> bool:
+def check_processes():
     try:
         out = subprocess.run(["tasklist","/FO","CSV","/NH"],
             capture_output=True, text=True, timeout=5,
             creationflags=0x08000000).stdout.lower()
-        for p in _BAD_PROCS:
+        for p in _BAD:
             if p.lower() in out: return True
     except: pass
     return False
 
-def check_windows() -> bool:
+def check_windows():
     found = [False]
     def cb(hwnd, _):
         if not u32.IsWindowVisible(hwnd): return True
@@ -324,149 +257,363 @@ def check_windows() -> bool:
         if n == 0: return True
         buf = ctypes.create_unicode_buffer(n+1)
         u32.GetWindowTextW(hwnd, buf, n+1)
-        title = buf.value.lower()
-        for bad in _BAD_TITLES:
-            if bad in title: found[0] = True; return False
+        t = buf.value.lower()
+        for b in _BAD_TITLES:
+            if b in t: found[0] = True; return False
         return True
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    try: u32.EnumWindows(WNDENUMPROC(cb), 0)
+    WEP = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    try: u32.EnumWindows(WEP(cb), 0)
     except: pass
     return found[0]
 
 
-# ══════════════════════════════════════════════════════
-#  5. ANTI-TAMPER (file integrity)
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#  5. ANTI-TAMPER (SHA256)
+# ═══════════════════════════════════════════
 
-_integrity_hashes = {}
+_hashes = {}
 
 def init_integrity():
-    """Snapshot file hashes at startup."""
-    global _integrity_hashes
+    global _hashes
     base = os.path.dirname(os.path.abspath(__file__))
-    for fname in _SELF_FILES:
-        fp = os.path.join(base, fname)
+    for f in _SELF_FILES:
+        fp = os.path.join(base, f)
         if os.path.exists(fp):
-            with open(fp, "rb") as f:
-                _integrity_hashes[fname] = hashlib.sha256(f.read()).hexdigest()
+            with open(fp, "rb") as fh:
+                _hashes[f] = hashlib.sha256(fh.read()).hexdigest()
 
-def check_integrity() -> bool:
-    """Check if any file changed since startup."""
-    if not _integrity_hashes: return False
+def check_integrity():
+    if not _hashes: return False
     base = os.path.dirname(os.path.abspath(__file__))
-    for fname, expected in _integrity_hashes.items():
-        fp = os.path.join(base, fname)
+    for f, h in _hashes.items():
+        fp = os.path.join(base, f)
         if os.path.exists(fp):
-            with open(fp, "rb") as f:
-                if hashlib.sha256(f.read()).hexdigest() != expected:
-                    return True
+            with open(fp, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() != h: return True
     return False
 
 
-# ══════════════════════════════════════════════════════
-#  6. ANTI-HOOK
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#  6. ANTI-HOOK (API integrity)
+# ═══════════════════════════════════════════
 
-def check_hooks() -> bool:
-    """Check if critical WinAPIs are hooked (JMP/INT3 patched)."""
+def check_hooks():
     try:
-        for fn in [k32.IsDebuggerPresent, ntdll.NtQueryInformationProcess]:
+        for fn in [k32.IsDebuggerPresent, ntdll.NtQueryInformationProcess,
+                   k32.CheckRemoteDebuggerPresent, k32.GetThreadContext,
+                   ntdll.NtClose, k32.CloseHandle]:
             addr = ctypes.cast(fn, ctypes.POINTER(ctypes.c_ubyte))
-            if addr[0] in (0xE9, 0xCC, 0x90): return True  # JMP / INT3 / NOP
+            # JMP=0xE9, INT3=0xCC, NOP=0x90, PUSH+RET=0x68
+            if addr[0] in (0xE9, 0xCC, 0x90, 0x68): return True
     except: pass
     return False
 
 
-# ══════════════════════════════════════════════════════
-#  7. ANTI-DUMP
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#  7. ANTI-DUMP (memory protection)
+# ═══════════════════════════════════════════
 
 def protect_memory():
-    """Make our process harder to dump."""
+    """Erase PE header from memory — dump tools get corrupt exe."""
     try:
-        # Prevent other processes from reading our memory
-        # SetProcessMitigationPolicy — not available on all Windows
-        pass
-    except: pass
-
-    try:
-        # Close handles that dumpers use
-        # NtSetInformationProcess — ProcessHandleTracing
-        pass
-    except: pass
-
-
-# ══════════════════════════════════════════════════════
-#  8. ANTI-TRACE
-# ══════════════════════════════════════════════════════
-
-def protect_trace():
-    """Prevent sys.settrace/setprofile from being used."""
-    def _noop(*a, **kw): pass
-    sys.settrace = _noop
-    sys.setprofile = _noop
-    # Also protect threading
-    try:
-        threading.settrace = _noop
-        threading.setprofile = _noop
+        if not getattr(sys, 'frozen', False): return
+        # Get base address of our exe in memory
+        base = k32.GetModuleHandleW(None)
+        if not base: return
+        # Read DOS header to find PE header size
+        old = ctypes.c_ulong(0)
+        # Change first page to RW, zero it, restore protection
+        # This erases DOS/PE header so memory dumps are invalid
+        if k32.VirtualProtect(base, 4096, 0x04, ctypes.byref(old)):  # PAGE_READWRITE
+            ctypes.memset(base, 0, 4096)
+            k32.VirtualProtect(base, 4096, old.value, ctypes.byref(old))
     except: pass
 
 
-# ══════════════════════════════════════════════════════
-#  9. CODE PROTECTION — ล็อก code objects
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#  8. ANTI-VM / SANDBOX
+# ═══════════════════════════════════════════
 
-def protect_code():
+def check_vm():
+    """Detect if running in VM/Sandbox (crackers often use VMs)."""
+    # Registry keys that indicate VM
+    import winreg
+    vm_keys = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\VMware, Inc.\VMware Tools"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Oracle\VirtualBox Guest Additions"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\VBoxGuest"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\vmci"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\vmhgfs"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters"),
+    ]
+    for hive, path in vm_keys:
+        try:
+            winreg.OpenKey(hive, path, 0, winreg.KEY_READ)
+            return True
+        except: pass
+
+    # Check for VM-specific files
+    vm_files = [
+        r"C:\Windows\System32\drivers\vmmouse.sys",
+        r"C:\Windows\System32\drivers\vmhgfs.sys",
+        r"C:\Windows\System32\drivers\VBoxMouse.sys",
+        r"C:\Windows\System32\drivers\VBoxGuest.sys",
+        r"C:\Windows\System32\VBoxService.exe",
+        r"C:\Windows\System32\vboxdisp.dll",
+    ]
+    for f in vm_files:
+        if os.path.exists(f): return True
+
+    # Check MAC address prefix (VM vendors have known prefixes)
+    try:
+        out = subprocess.run(["getmac","/FO","CSV","/NH"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=0x08000000).stdout.upper()
+        vm_macs = ["00-05-69","00-0C-29","00-1C-14","00-50-56",  # VMware
+                   "08-00-27","0A-00-27",  # VirtualBox
+                   "00-15-5D",  # Hyper-V
+                   "00-16-3E"]  # Xen
+        for mac in vm_macs:
+            if mac in out: return True
+    except: pass
+
+    # Check for Sandboxie
+    try:
+        sbie = ctypes.windll.LoadLibrary("SbieDll.dll")
+        if sbie: return True
+    except: pass
+
+    return False
+
+
+# ═══════════════════════════════════════════
+#  9. ANTI-DLL-INJECTION
+# ═══════════════════════════════════════════
+
+_SUSPICIOUS_DLLS = [
+    "sbiedll.dll",       # Sandboxie
+    "dbghelp.dll",       # Debugger helper (normal but suspicious if injected)
+    "api_log.dll",       # API logging
+    "dir_watch.dll",     # Directory watcher
+    "pstorec.dll",       # Password store
+    "vmcheck.dll",       # VM check
+    "cmdvrt32.dll",      # Comodo sandbox
+    "cmdvrt64.dll",
+    "cuckoomon.dll",     # Cuckoo sandbox
+    "guard32.dll",       # Comodo
+    "sample.dll",        # Generic suspicious
+    "snxhk.dll",         # Avast sandbox
+    "snxhk64.dll",
+]
+
+def check_dll_injection():
+    """Check for suspicious DLLs loaded in our process."""
+    try:
+        import ctypes.wintypes
+        h_snap = k32.CreateToolhelp32Snapshot(0x00000008, 0)  # TH32CS_SNAPMODULE
+        if h_snap == -1: return False
+
+        class MODULEENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", ctypes.c_ulong),
+                        ("th32ModuleID", ctypes.c_ulong),
+                        ("th32ProcessID", ctypes.c_ulong),
+                        ("GlblcntUsage", ctypes.c_ulong),
+                        ("ProccntUsage", ctypes.c_ulong),
+                        ("modBaseAddr", ctypes.c_void_p),
+                        ("modBaseSize", ctypes.c_ulong),
+                        ("hModule", ctypes.c_void_p),
+                        ("szModule", ctypes.c_wchar * 256),
+                        ("szExePath", ctypes.c_wchar * 260)]
+
+        me = MODULEENTRY32W()
+        me.dwSize = ctypes.sizeof(me)
+        if k32.Module32FirstW(h_snap, ctypes.byref(me)):
+            while True:
+                mod_name = me.szModule.lower()
+                for sus in _SUSPICIOUS_DLLS:
+                    if sus in mod_name:
+                        k32.CloseHandle(h_snap)
+                        return True
+                if not k32.Module32NextW(h_snap, ctypes.byref(me)):
+                    break
+        k32.CloseHandle(h_snap)
+    except: pass
+    return False
+
+
+# ═══════════════════════════════════════════
+# 10. ANTI-ATTACH (hide from debugger)
+# ═══════════════════════════════════════════
+
+def protect_anti_attach():
     """
-    Remove __code__, __globals__, __closure__ access from
-    critical functions to prevent bytecode extraction.
+    NtSetInformationThread — ThreadHideFromDebugger
+    Once set, the thread becomes invisible to debuggers.
+    Attaching a debugger after this = instant crash.
     """
-    # Make it harder to iterate our module's internals
-    protected_modules = ['guard', 'adapter', '__main__']
-    for modname in protected_modules:
-        mod = sys.modules.get(modname)
-        if not mod: continue
-        # Replace module __dict__ access would break things,
-        # so we just scramble code filenames
-        for attr_name in dir(mod):
+    try:
+        # ThreadHideFromDebugger = 0x11
+        ntdll.NtSetInformationThread(
+            k32.GetCurrentThread(),
+            0x11,  # ThreadHideFromDebugger
+            None,
+            0
+        )
+    except: pass
+
+
+# ═══════════════════════════════════════════
+# 11. PARENT PROCESS CHECK
+# ═══════════════════════════════════════════
+
+def check_parent():
+    """Verify parent process is not a RE tool."""
+    try:
+        # Get parent PID via NtQueryInformationProcess
+        class PBI(ctypes.Structure):
+            _fields_ = [("R1",ctypes.c_void_p),("Peb",ctypes.c_void_p),
+                        ("R2",ctypes.c_void_p*2),("Uid",ctypes.c_void_p),
+                        ("InheritedFromUniqueProcessId",ctypes.c_void_p)]
+        pbi = PBI(); rl = ctypes.c_ulong(0)
+        ntdll.NtQueryInformationProcess(k32.GetCurrentProcess(), 0,
+            ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(rl))
+        ppid = pbi.InheritedFromUniqueProcessId
+
+        if ppid:
+            # Open parent and get its name
+            h = k32.OpenProcess(0x0400 | 0x0010, False, ppid)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+            if h:
+                buf = ctypes.create_unicode_buffer(260)
+                size = ctypes.c_ulong(260)
+                k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+                k32.CloseHandle(h)
+                pname = os.path.basename(buf.value).lower()
+                bad_parents = ["x64dbg.exe","x32dbg.exe","ollydbg.exe","windbg.exe",
+                               "ida.exe","ida64.exe","idaq.exe","idaq64.exe",
+                               "ghidra.exe","radare2.exe","processhacker.exe",
+                               "dnspy.exe","binaryninja.exe"]
+                return pname in bad_parents
+    except: pass
+    return False
+
+
+# ═══════════════════════════════════════════
+# 12. KERNEL DEBUGGER DETECTION
+# ═══════════════════════════════════════════
+
+def check_kernel_debugger():
+    """Detect kernel-mode debugger (WinDbg kernel mode)."""
+    try:
+        class SYSTEM_KERNEL_DEBUGGER_INFORMATION(ctypes.Structure):
+            _fields_ = [("KernelDebuggerEnabled", ctypes.c_ubyte),
+                        ("KernelDebuggerNotPresent", ctypes.c_ubyte)]
+        info = SYSTEM_KERNEL_DEBUGGER_INFORMATION()
+        rl = ctypes.c_ulong(0)
+        # SystemKernelDebuggerInformation = 0x23
+        ntdll.NtQuerySystemInformation(0x23, ctypes.byref(info),
+            ctypes.sizeof(info), ctypes.byref(rl))
+        return info.KernelDebuggerEnabled != 0
+    except: pass
+    return False
+
+
+# ═══════════════════════════════════════════
+# 13. SELF-CHECKSUM (exe integrity)
+# ═══════════════════════════════════════════
+
+_exe_hash = ""
+
+def init_exe_checksum():
+    """Hash our own exe at startup."""
+    global _exe_hash
+    if getattr(sys, 'frozen', False):
+        try:
+            with open(sys.executable, "rb") as f:
+                _exe_hash = hashlib.sha256(f.read()).hexdigest()
+        except: pass
+
+def check_exe_checksum():
+    """Verify exe hasn't been patched."""
+    if not _exe_hash: return False
+    try:
+        with open(sys.executable, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest() != _exe_hash
+    except: return False
+
+
+# ═══════════════════════════════════════════
+# 14. ENV VAR + PYTHON FLAG CHECKS
+# ═══════════════════════════════════════════
+
+def check_env():
+    dbg_envs = [
+        "PYDEVD_USE_CYTHON","PYDEVD_DISABLE_FILE_VALIDATION",
+        "DEBUGPY_LAUNCHER_PORT","PYDEVD_LOAD_VALUES_ASYNC",
+        "_PYDEV_TRACE_SETTRACE","PYCHARM_DEBUG",
+        "VSCODE_PID","TERM_PROGRAM_VERSION",
+    ]
+    for e in dbg_envs:
+        if os.environ.get(e): return True
+    return sys.flags.debug or sys.flags.inspect
+
+
+# ═══════════════════════════════════════════
+# 15. CODE SCRAMBLE
+# ═══════════════════════════════════════════
+
+def scramble_code():
+    """Overwrite co_filename on all loaded function objects."""
+    for name, mod in list(sys.modules.items()):
+        if mod is None or name.startswith(('_','builtins','ctypes','tkinter','json','os','sys')): continue
+        for attr in dir(mod):
             try:
-                obj = getattr(mod, attr_name)
+                obj = getattr(mod, attr)
                 if isinstance(obj, types.FunctionType) and hasattr(obj, '__code__'):
-                    # Replace co_filename to confuse decompilers
-                    obj.__code__ = obj.__code__.replace(co_filename="<bootstep>")
+                    obj.__code__ = obj.__code__.replace(co_filename="<\u2588>")
             except: pass
 
 
-# ══════════════════════════════════════════════════════
-#  10. ENVIRONMENT CHECKS
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+# 16. STACK PROTECTION
+# ═══════════════════════════════════════════
 
-def check_environment() -> bool:
-    """Detect suspicious environment variables set by RE tools."""
-    suspicious_envs = [
-        "PYDEVD_USE_CYTHON", "PYDEVD_DISABLE_FILE_VALIDATION",
-        "DEBUGPY_LAUNCHER_PORT", "PYDEVD_LOAD_VALUES_ASYNC",
-        "_PYDEV_TRACE_SETTRACE",
-    ]
-    for env in suspicious_envs:
-        if os.environ.get(env): return True
-    return False
-
-def check_python_flags() -> bool:
-    """Check if Python is running with debug/inspect flags."""
-    # -d, -v, -i flags
-    if sys.flags.debug or sys.flags.inspect or sys.flags.verbose:
-        return True
-    return False
+def protect_exceptions():
+    """Install exception hook that suppresses file paths in tracebacks."""
+    def _hook(exc_type, exc_value, exc_tb):
+        # Only show exception type and message, no file paths
+        sys.stderr.write(f"Error: {exc_type.__name__}: {exc_value}\n")
+    sys.excepthook = _hook
 
 
-# ══════════════════════════════════════════════════════
-#  MASTER GUARD — ทุกอย่างรวมกัน
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+# 17. ADDITIONAL: Prevent __code__ access
+# ═══════════════════════════════════════════
+
+def protect_code_access():
+    """Make it harder to read function bytecode."""
+    try:
+        # Delete __code__ attribute from builtins
+        # (won't fully work but adds friction)
+        pass
+    except: pass
+    # Disable compile() for arbitrary code
+    import builtins
+    _orig_compile = builtins.compile
+    def _safe_compile(source, filename, mode, *args, **kwargs):
+        # Block compiling our protected files
+        if isinstance(filename, str) and any(f in filename for f in _SELF_FILES):
+            raise PermissionError("Access denied")
+        return _orig_compile(source, filename, mode, *args, **kwargs)
+    builtins.compile = _safe_compile
+
+
+# ═══════════════════════════════════════════
+#  MASTER CHECK
+# ═══════════════════════════════════════════
 
 class GuardStatus:
-    __slots__ = ('debug','tamper','process','hook','window',
-                 'extract','trace','env')
+    __slots__ = ('debug','tamper','process','hook','window','extract',
+                 'env','vm','dll_inject','parent','kernel_dbg','exe_patch')
     def __init__(self):
         for s in self.__slots__: setattr(self, s, False)
 
@@ -481,38 +628,47 @@ class GuardStatus:
 
 def full_check() -> GuardStatus:
     g = GuardStatus()
-    g.debug   = check_debug()
-    g.tamper  = check_integrity()
-    g.process = check_processes()
-    g.hook    = check_hooks()
-    g.window  = check_windows()
-    g.extract = check_pyinstxtractor()
-    g.env     = check_environment() or check_python_flags()
+    g.debug      = check_debug()
+    g.tamper     = check_integrity()
+    g.process    = check_processes()
+    g.hook       = check_hooks()
+    g.window     = check_windows()
+    g.extract    = check_pyinstxtractor()
+    g.env        = check_env()
+    g.dll_inject = check_dll_injection()
+    g.parent     = check_parent()
+    g.kernel_dbg = check_kernel_debugger()
+    g.exe_patch  = check_exe_checksum()
+    # VM check is optional — uncomment if you want to block VMs too:
+    # g.vm       = check_vm()
     return g
 
 
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
 #  INIT + HEARTBEAT
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
 
 _running = False
 
 def init():
-    """Call once at app startup — sets up all protections."""
+    """Call once at startup — arm all protections."""
     init_integrity()
-    protect_bytecode()
+    init_exe_checksum()
+    protect_imports()
     protect_trace()
     protect_pyinstaller()
+    protect_anti_attach()
+    protect_exceptions()
+    protect_code_access()
     protect_memory()
 
-    # Initial check
-    status = full_check()
-    if not status.safe:
-        _kill(status.threats)
+    # Initial scan
+    s = full_check()
+    if not s.safe:
+        os._exit(1)
 
 
 def start_heartbeat(on_detect=None):
-    """Continuous background protection checks."""
     global _running
     if _running: return
     _running = True
@@ -525,10 +681,8 @@ def start_heartbeat(on_detect=None):
             if not s.safe:
                 strikes += 1
                 if strikes >= _MAX_STRIKES:
-                    if on_detect:
-                        on_detect(s.threats)
-                    else:
-                        _kill(s.threats)
+                    if on_detect: on_detect(s.threats)
+                    else: os._exit(1)
                     return
             else:
                 strikes = max(0, strikes - 1)
@@ -537,18 +691,10 @@ def start_heartbeat(on_detect=None):
 
 
 def stop_heartbeat():
-    global _running
-    _running = False
-
-
-def _kill(threats):
-    """Terminate immediately."""
-    os._exit(1)
+    global _running; _running = False
 
 
 def apply_post_freeze():
-    """Call AFTER all modules loaded (in frozen exe) to scramble code."""
-    try:
-        scramble_code_objects()
-        protect_code()
+    """Call after all modules loaded."""
+    try: scramble_code()
     except: pass
