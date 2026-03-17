@@ -278,3 +278,113 @@ def get_net_stats(name):
         "rx_errs": d.get("ReceivedPacketErrors",0), "tx_errs": d.get("OutboundPacketErrors",0),
         "rx_disc": d.get("ReceivedDiscards",0), "tx_disc": d.get("OutboundDiscards",0),
     }
+
+# ─── Profile System ───
+PROFILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles")
+
+def _ensure_profiles_dir():
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+
+def profile_save(adapter_name: str, profile_name: str, description: str = "") -> str:
+    """Save current adapter settings as a named profile. Returns filepath."""
+    _ensure_profiles_dir()
+    data = {
+        "_meta": {
+            "profile_name": profile_name,
+            "description": description,
+            "adapter": adapter_name,
+            "created": datetime.now().isoformat(),
+            "tool": "NATweaker",
+        },
+        "rss": get_rss(adapter_name),
+        "global": get_global(),
+        "iface_v4": get_iface(adapter_name, "IPv4"),
+        "adv": {p.keyword: {"display": p.display_value, "reg": p.reg_value}
+                for p in get_adv_props(adapter_name)},
+        "afd": get_afd(),
+    }
+    safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in profile_name).strip()
+    filepath = os.path.join(PROFILES_DIR, f"{safe_name}.json")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return filepath
+
+def profile_list() -> list:
+    """Return list of saved profiles: [{name, desc, adapter, created, path}, ...]"""
+    _ensure_profiles_dir()
+    profiles = []
+    for fname in sorted(os.listdir(PROFILES_DIR)):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(PROFILES_DIR, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            meta = data.get("_meta", {})
+            profiles.append({
+                "name": meta.get("profile_name", fname.replace(".json", "")),
+                "desc": meta.get("description", ""),
+                "adapter": meta.get("adapter", ""),
+                "created": meta.get("created", ""),
+                "path": fpath,
+                "filename": fname,
+            })
+        except Exception:
+            profiles.append({
+                "name": fname.replace(".json", ""),
+                "desc": "(corrupt)", "adapter": "", "created": "",
+                "path": fpath, "filename": fname,
+            })
+    return profiles
+
+def profile_load(adapter_name: str, filepath: str) -> int:
+    """Apply a saved profile to the adapter. Returns number of settings applied."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    n = 0
+    if "rss" in data and data["rss"]:
+        clean = {k: v for k, v in data["rss"].items()
+                 if k in ("Enabled","NumberOfReceiveQueues","Profile",
+                          "BaseProcessorNumber","MaxProcessorNumber","MaxProcessors") and v}
+        if clean:
+            set_rss(adapter_name, clean); n += len(clean)
+    if "global" in data and data["global"]:
+        clean = {k: v for k, v in data["global"].items()
+                 if k in ("ReceiveSideScaling","ReceiveSegmentCoalescing","Chimney",
+                          "TaskOffload","NetworkDirect","NetworkDirectAcrossIPSubnets",
+                          "PacketCoalescingFilter") and v}
+        if clean:
+            set_global(clean); n += len(clean)
+    if "adv" in data:
+        for kw, info in data["adv"].items():
+            rv = info.get("reg", info.get("display", ""))
+            if rv:
+                set_adv(adapter_name, kw, rv); n += 1
+    if "afd" in data:
+        for k, v in data["afd"].items():
+            if v:
+                try: set_afd(k, int(v)); n += 1
+                except: pass
+    return n
+
+def profile_delete(filepath: str) -> bool:
+    """Delete a saved profile."""
+    try:
+        os.remove(filepath)
+        return True
+    except: return False
+
+def profile_rename(filepath: str, new_name: str) -> str:
+    """Rename a profile. Returns new filepath."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("_meta", {})["profile_name"] = new_name
+        safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in new_name).strip()
+        new_path = os.path.join(os.path.dirname(filepath), f"{safe}.json")
+        with open(new_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        if new_path != filepath:
+            os.remove(filepath)
+        return new_path
+    except: return filepath

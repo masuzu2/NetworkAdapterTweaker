@@ -5,6 +5,7 @@ dist/
 *.pyc
 __pycache__/
 backups/
+profiles/
 .vs/
 node_modules/
 src/

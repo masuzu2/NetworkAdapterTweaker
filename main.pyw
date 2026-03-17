@@ -330,6 +330,7 @@ class App:
             ("Default", lambda: self._preset("default"), DIM, HEADER),
             ("Export", self._export, YELLOW, "#222200"),
             ("Import", self._import, CYAN, "#002222"),
+            ("Profiles", self._open_profiles, "#ff88cc", "#220011"),
         ]
         for text, cmd, fg, bg_c in btns:
             b = tk.Button(r1, text=text, font=FONT_S, fg=fg, bg=bg_c, bd=1,
@@ -608,11 +609,221 @@ class App:
 
     def _open_ncpa(self): os.system("start ncpa.cpl")
 
+    # ── Profiles ──
+    def _open_profiles(self):
+        if not self.cur: return
+        ProfileDialog(self.root, self.cur, self._select)
+
     def _status(self, msg):
         self.status_lbl.configure(text=f"  {msg}")
 
     def run(self):
         self.root.mainloop()
+
+
+# ══════════════════════════════════════════════════
+#  Profile Manager Dialog
+# ══════════════════════════════════════════════════
+class ProfileDialog(tk.Toplevel):
+    """Full profile manager — save, load, delete, rename."""
+
+    def __init__(self, parent, adapter_name, reload_callback):
+        super().__init__(parent)
+        self.adapter = adapter_name
+        self.reload_cb = reload_callback
+        self.title("Profile Manager")
+        self.geometry("620x520")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self._build()
+        self._refresh_list()
+
+    def _build(self):
+        # ── Header ──
+        hdr = tk.Frame(self, bg=HEADER, height=50)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="  Profile Manager", font=("Consolas", 14, "bold"),
+                 fg="#ff88cc", bg=HEADER, anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Label(hdr, text=f"Adapter: {self.adapter}  ", font=FONT_S,
+                 fg=DIM, bg=HEADER).pack(side="right")
+
+        # ── Save New Profile ──
+        save_frame = tk.Frame(self, bg=PANEL, pady=6)
+        save_frame.pack(fill="x", padx=8, pady=(8,4))
+
+        tk.Label(save_frame, text="Save Current Settings as Profile:", font=FONT_B,
+                 fg=CYAN, bg=PANEL).pack(anchor="w", padx=8)
+
+        row = tk.Frame(save_frame, bg=PANEL)
+        row.pack(fill="x", padx=8, pady=(4,2))
+
+        tk.Label(row, text="Name:", font=FONT_S, fg=LBL, bg=PANEL).pack(side="left")
+        self.save_name_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.save_name_var, width=25, font=FONT_M).pack(side="left", padx=(4,8))
+
+        tk.Label(row, text="Desc:", font=FONT_S, fg=LBL, bg=PANEL).pack(side="left")
+        self.save_desc_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.save_desc_var, width=25, font=FONT_M).pack(side="left", padx=(4,8))
+
+        tk.Button(row, text="Save Profile", font=FONT_B, fg=GREEN, bg="#002211",
+                  bd=1, relief="solid", padx=10, cursor="hand2",
+                  activebackground=HOVER, activeforeground=GREEN,
+                  command=self._save).pack(side="right")
+
+        # ── Separator ──
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=8)
+
+        # ── Profile List ──
+        list_hdr = tk.Frame(self, bg=BG)
+        list_hdr.pack(fill="x", padx=8, pady=(8,2))
+        tk.Label(list_hdr, text="Saved Profiles:", font=FONT_B,
+                 fg="#ff88cc", bg=BG).pack(side="left")
+
+        # Listbox with scrollbar
+        list_frame = tk.Frame(self, bg=BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=(0,4))
+
+        cols = ("name", "desc", "adapter", "created")
+        self.tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+                                  selectmode="browse", height=10)
+        self.tree.heading("name", text="Profile Name")
+        self.tree.heading("desc", text="Description")
+        self.tree.heading("adapter", text="Adapter")
+        self.tree.heading("created", text="Created")
+        self.tree.column("name", width=140, minwidth=100)
+        self.tree.column("desc", width=180, minwidth=80)
+        self.tree.column("adapter", width=120, minwidth=60)
+        self.tree.column("created", width=140, minwidth=80)
+
+        # Treeview dark style
+        style = ttk.Style()
+        style.configure("Treeview", background=INPUT_BG, foreground=CYAN,
+                         fieldbackground=INPUT_BG, font=FONT_M, rowheight=22)
+        style.configure("Treeview.Heading", background=HEADER, foreground=LBL,
+                         font=FONT_B)
+        style.map("Treeview", background=[("selected", BORDER)],
+                   foreground=[("selected", CYAN)])
+
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # ── Action Buttons ──
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.pack(fill="x", padx=8, pady=(4,8))
+
+        actions = [
+            ("Load & Apply", self._load,   GREEN,    "#002211"),
+            ("Rename",       self._rename, YELLOW,   "#222200"),
+            ("Delete",       self._delete, RED,      "#220000"),
+            ("Open Folder",  self._open_folder, DIM, HEADER),
+        ]
+        for text, cmd, fg, bg_c in actions:
+            tk.Button(btn_frame, text=text, font=FONT_B, fg=fg, bg=bg_c,
+                      bd=1, relief="solid", padx=10, pady=2, cursor="hand2",
+                      activebackground=HOVER, activeforeground=fg,
+                      command=cmd).pack(side="left", padx=(0,4))
+
+        tk.Button(btn_frame, text="Close", font=FONT_B, fg=TXT, bg=HEADER,
+                  bd=1, relief="solid", padx=12, pady=2, cursor="hand2",
+                  activebackground=HOVER, command=self.destroy).pack(side="right")
+
+    def _refresh_list(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.profiles = B.profile_list()
+        for p in self.profiles:
+            created = p["created"][:16].replace("T", " ") if p["created"] else ""
+            self.tree.insert("", "end", values=(
+                p["name"], p["desc"], p["adapter"], created
+            ))
+
+    def _get_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Profile", "Select a profile first.", parent=self)
+            return None
+        idx = self.tree.index(sel[0])
+        if idx < len(self.profiles):
+            return self.profiles[idx]
+        return None
+
+    def _save(self):
+        name = self.save_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Save Profile", "Enter a profile name.", parent=self)
+            return
+        desc = self.save_desc_var.get().strip()
+        # Check if name already exists
+        existing = [p for p in B.profile_list() if p["name"] == name]
+        if existing:
+            if not messagebox.askyesno("Overwrite", f"Profile '{name}' already exists.\nOverwrite?", parent=self):
+                return
+            B.profile_delete(existing[0]["path"])
+
+        path = B.profile_save(self.adapter, name, desc)
+        self.save_name_var.set("")
+        self.save_desc_var.set("")
+        self._refresh_list()
+        messagebox.showinfo("Saved", f"Profile '{name}' saved!", parent=self)
+
+    def _load(self):
+        p = self._get_selected()
+        if not p: return
+        if messagebox.askyesno("Load Profile",
+                f"Apply profile '{p['name']}'?\n\n{p['desc']}\n\n"
+                f"Auto-backup will be created first.", parent=self):
+            B.auto_backup(self.adapter)
+            n = B.profile_load(self.adapter, p["path"])
+            messagebox.showinfo("Applied",
+                f"Profile '{p['name']}' applied!\n{n} settings changed.", parent=self)
+            self.reload_cb(self.adapter)
+
+    def _rename(self):
+        p = self._get_selected()
+        if not p: return
+        # Simple rename dialog
+        dlg = tk.Toplevel(self)
+        dlg.title("Rename Profile")
+        dlg.geometry("350x120")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"Rename '{p['name']}' to:", font=FONT_B,
+                 fg=CYAN, bg=BG).pack(padx=12, pady=(12,4), anchor="w")
+        var = tk.StringVar(value=p["name"])
+        ttk.Entry(dlg, textvariable=var, width=35, font=FONT_M).pack(padx=12)
+
+        def do_rename():
+            new_name = var.get().strip()
+            if new_name and new_name != p["name"]:
+                B.profile_rename(p["path"], new_name)
+                self._refresh_list()
+            dlg.destroy()
+
+        bf = tk.Frame(dlg, bg=BG)
+        bf.pack(pady=8)
+        tk.Button(bf, text="Rename", font=FONT_B, fg=GREEN, bg="#002211",
+                  bd=1, relief="solid", padx=10, command=do_rename).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", font=FONT_B, fg=TXT, bg=HEADER,
+                  bd=1, relief="solid", padx=10, command=dlg.destroy).pack(side="left")
+
+    def _delete(self):
+        p = self._get_selected()
+        if not p: return
+        if messagebox.askyesno("Delete", f"Delete profile '{p['name']}'?", parent=self):
+            B.profile_delete(p["path"])
+            self._refresh_list()
+
+    def _open_folder(self):
+        B._ensure_profiles_dir()
+        os.startfile(B.PROFILES_DIR)
 
 
 # ══════════════════════════════════════════════════
