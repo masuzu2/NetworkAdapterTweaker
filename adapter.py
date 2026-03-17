@@ -1,434 +1,280 @@
 """
-Network Adapter Tweaker — Backend Engine
-Direct registry access + PowerShell for NIC settings.
+Network Adapter Tweaker — Backend Engine v2
+Direct registry + PowerShell hybrid for maximum performance.
 """
-
-import subprocess
-import json
-import winreg
-import logging
-import os
-import ctypes
-from typing import Dict, List, Optional, Tuple, Any
+import subprocess, json, winreg, ctypes, sys, os, logging, time
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
 log = logging.getLogger("NATweaker")
 
-# ───────────────────────────────────────────────────────
-#  Helpers
-# ───────────────────────────────────────────────────────
-
+# ─── Admin ───
 def is_admin() -> bool:
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
-
+    try: return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except: return False
 
 def run_as_admin():
-    """Re-launch the current script as admin."""
-    import sys
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, " ".join(sys.argv), None, 1
-    )
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
     sys.exit(0)
 
+# ─── PowerShell ───
+_PS_FLAGS = 0x08000000  # CREATE_NO_WINDOW
 
-def ps(cmd: str, timeout: int = 15) -> str:
-    """Run a PowerShell command, return stdout."""
+def ps(cmd: str, timeout: int = 20) -> str:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd],
-            capture_output=True, text=True, timeout=timeout, creationflags=0x08000000
-        )
+            capture_output=True, text=True, timeout=timeout, creationflags=_PS_FLAGS)
         return r.stdout.strip()
-    except Exception as e:
-        log.warning("PS error: %s", e)
-        return ""
+    except: return ""
 
-
-def ps_json(cmd: str, timeout: int = 15) -> list:
-    """Run PS command → JSON → list of dicts."""
-    raw = ps(cmd + " | ConvertTo-Json -Depth 4 -Compress", timeout)
-    if not raw:
-        return []
+def ps_json(cmd: str) -> list:
+    raw = ps(cmd + " | ConvertTo-Json -Depth 4 -Compress")
+    if not raw: return []
     try:
-        data = json.loads(raw)
-        return data if isinstance(data, list) else [data]
-    except json.JSONDecodeError:
-        return []
+        d = json.loads(raw)
+        return d if isinstance(d, list) else [d]
+    except: return []
 
-
-# ───────────────────────────────────────────────────────
-#  Registry helpers (direct, no PowerShell)
-# ───────────────────────────────────────────────────────
-
-def reg_read_dword(hive, path: str, name: str) -> Optional[int]:
+# ─── Registry (direct — fast) ───
+def reg_read(hive, path, name, expect_type=None):
     try:
-        with winreg.OpenKey(hive, path, 0, winreg.KEY_READ) as key:
-            val, typ = winreg.QueryValueEx(key, name)
-            if typ == winreg.REG_DWORD:
-                return val
-    except OSError:
-        pass
-    return None
+        with winreg.OpenKey(hive, path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            val, typ = winreg.QueryValueEx(k, name)
+            return val
+    except: return None
 
-
-def reg_write_dword(hive, path: str, name: str, value: int) -> bool:
+def reg_write_dword(hive, path, name, value):
     try:
-        with winreg.CreateKeyEx(hive, path, 0, winreg.KEY_WRITE) as key:
-            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+        with winreg.CreateKeyEx(hive, path, 0, winreg.KEY_WRITE | winreg.KEY_WOW64_64KEY) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, int(value))
         return True
-    except OSError as e:
-        log.error("reg_write_dword %s\\%s = %d failed: %s", path, name, value, e)
-        return False
+    except: return False
 
-
-def reg_read_string(hive, path: str, name: str) -> Optional[str]:
+def reg_delete(hive, path, name):
     try:
-        with winreg.OpenKey(hive, path, 0, winreg.KEY_READ) as key:
-            val, typ = winreg.QueryValueEx(key, name)
-            return str(val)
-    except OSError:
-        pass
-    return None
+        with winreg.OpenKey(hive, path, 0, winreg.KEY_WRITE | winreg.KEY_WOW64_64KEY) as k:
+            winreg.DeleteValue(k, name)
+        return True
+    except: return False
 
-
-# ───────────────────────────────────────────────────────
-#  Adapter Info
-# ───────────────────────────────────────────────────────
-
-class AdapterInfo:
-    __slots__ = ("name", "description", "status", "mac", "speed", "driver", "ndis", "guid", "if_index")
-
+# ─── Adapter Discovery ───
+class Adapter:
     def __init__(self, **kw):
-        for s in self.__slots__:
-            setattr(self, s, kw.get(s, ""))
+        self.name = kw.get("name", "")
+        self.desc = kw.get("desc", "")
+        self.status = kw.get("status", "")
+        self.mac = kw.get("mac", "")
+        self.speed = kw.get("speed", "")
+        self.driver = kw.get("driver", "")
+        self.ndis = kw.get("ndis", "")
+        self.guid = kw.get("guid", "")
+        self.ifindex = kw.get("ifindex", "")
+        self.reg_path = ""
 
-    def display(self) -> str:
-        s = self.description or self.name
-        if self.status and self.status != "Up":
-            s += f" ({self.status})"
+    def label(self):
+        s = self.desc or self.name
+        if self.status != "Up": s += f" ({self.status})"
         return s
 
-
-def get_adapters() -> List[AdapterInfo]:
-    """Get all network adapters."""
+def get_adapters() -> List[Adapter]:
     data = ps_json(
-        "Get-NetAdapter | Select-Object Name, InterfaceDescription, Status, "
-        "MacAddress, LinkSpeed, DriverVersion, NdisVersion, InterfaceGuid, ifIndex"
+        "Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,"
+        "MacAddress,LinkSpeed,DriverVersion,NdisVersion,InterfaceGuid,ifIndex"
     )
-    result = []
+    out = []
     for d in data:
-        result.append(AdapterInfo(
-            name=d.get("Name", ""),
-            description=d.get("InterfaceDescription", ""),
-            status=d.get("Status", ""),
-            mac=d.get("MacAddress", ""),
-            speed=d.get("LinkSpeed", ""),
-            driver=d.get("DriverVersion", ""),
-            ndis=str(d.get("NdisVersion", "")),
-            guid=d.get("InterfaceGuid", ""),
-            if_index=str(d.get("ifIndex", "")),
+        out.append(Adapter(
+            name=d.get("Name",""), desc=d.get("InterfaceDescription",""),
+            status=d.get("Status",""), mac=d.get("MacAddress",""),
+            speed=d.get("LinkSpeed",""), driver=d.get("DriverVersion",""),
+            ndis=str(d.get("NdisVersion","")), guid=d.get("InterfaceGuid",""),
+            ifindex=str(d.get("ifIndex","")),
         ))
-    # Sort: Up first, then by name
-    result.sort(key=lambda a: (0 if a.status == "Up" else 1, a.name))
-    return result
+    out.sort(key=lambda a: (0 if a.status == "Up" else 1, a.name))
+    return out
 
-
-def get_adapter_reg_path(adapter_name: str) -> str:
-    """Find the adapter's registry path under Class\\{4D36E972...}."""
+def get_reg_path(name: str) -> str:
     return ps(
-        "$items = Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-        "{4D36E972-E325-11CE-BFC1-08002BE10318}' -EA SilentlyContinue; "
-        f"$guid = (Get-NetAdapter -Name '{adapter_name}').InterfaceGuid; "
-        "foreach($i in $items){ $g = (Get-ItemProperty $i.PSPath -Name "
-        "'NetCfgInstanceId' -EA SilentlyContinue).NetCfgInstanceId; "
-        "if($g -eq $guid){ $i.PSPath -replace "
-        "'Microsoft.PowerShell.Core\\\\Registry::',''; break } }"
+        "$items=Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+        "{4D36E972-E325-11CE-BFC1-08002BE10318}' -EA SilentlyContinue;"
+        f"$guid=(Get-NetAdapter -Name '{name}').InterfaceGuid;"
+        "foreach($i in $items){{$g=(Get-ItemProperty $i.PSPath -Name "
+        "'NetCfgInstanceId' -EA SilentlyContinue).NetCfgInstanceId;"
+        "if($g -eq $guid){{$i.PSPath -replace "
+        "'Microsoft.PowerShell.Core\\\\Registry::','';break}}}}"
     )
 
-
-# ───────────────────────────────────────────────────────
-#  Advanced Properties
-# ───────────────────────────────────────────────────────
-
-class AdvProperty:
-    __slots__ = ("keyword", "display_name", "display_value", "reg_value",
-                 "valid_display", "valid_registry")
-
+# ─── Advanced Properties ───
+class AdvProp:
+    __slots__ = ("keyword","display_name","display_value","reg_value","valid_display","valid_reg")
     def __init__(self, **kw):
-        self.keyword = kw.get("keyword", "")
-        self.display_name = kw.get("display_name", "")
-        self.display_value = kw.get("display_value", "")
-        self.reg_value = kw.get("reg_value", "")
-        self.valid_display = kw.get("valid_display", [])
-        self.valid_registry = kw.get("valid_registry", [])
+        self.keyword = kw.get("keyword","")
+        self.display_name = kw.get("display_name","")
+        self.display_value = kw.get("display_value","")
+        self.reg_value = kw.get("reg_value","")
+        self.valid_display = kw.get("valid_display",[])
+        self.valid_reg = kw.get("valid_reg",[])
 
+    def display_to_reg(self, display_val):
+        for i, dv in enumerate(self.valid_display):
+            if dv == display_val and i < len(self.valid_reg):
+                return self.valid_reg[i]
+        return display_val
 
-def get_adv_properties(adapter_name: str) -> List[AdvProperty]:
-    """Get all advanced properties for an adapter."""
+def get_adv_props(name: str) -> List[AdvProp]:
     data = ps_json(
-        f"Get-NetAdapterAdvancedProperty -Name '{adapter_name}' -EA SilentlyContinue "
-        "| Select-Object RegistryKeyword, DisplayName, DisplayValue, RegistryValue, "
-        "ValidDisplayValues, ValidRegistryValues"
+        f"Get-NetAdapterAdvancedProperty -Name '{name}' -EA SilentlyContinue "
+        "| Select-Object RegistryKeyword,DisplayName,DisplayValue,RegistryValue,"
+        "ValidDisplayValues,ValidRegistryValues"
     )
-    result = []
-    for d in data:
-        result.append(AdvProperty(
-            keyword=d.get("RegistryKeyword", ""),
-            display_name=d.get("DisplayName", ""),
-            display_value=str(d.get("DisplayValue", "")),
-            reg_value=str(d.get("RegistryValue", "")),
-            valid_display=d.get("ValidDisplayValues") or [],
-            valid_registry=d.get("ValidRegistryValues") or [],
-        ))
-    return result
+    return [AdvProp(
+        keyword=d.get("RegistryKeyword",""),
+        display_name=d.get("DisplayName",""),
+        display_value=str(d.get("DisplayValue","")),
+        reg_value=str(d.get("RegistryValue","")),
+        valid_display=d.get("ValidDisplayValues") or [],
+        valid_reg=d.get("ValidRegistryValues") or [],
+    ) for d in data]
 
+# ─── Read settings ───
+def get_rss(name): return {k:str(v) for k,v in (ps_json(f"Get-NetAdapterRss -Name '{name}' -EA SilentlyContinue | Select-Object *") or [{}])[0].items()}
+def get_global(): return {k:str(v) for k,v in (ps_json("Get-NetOffloadGlobalSetting | Select-Object *") or [{}])[0].items()}
+def get_iface(name, fam="IPv4"): return {k:str(v) for k,v in (ps_json(f"Get-NetIPInterface -InterfaceAlias '{name}' -AddressFamily {fam} -EA SilentlyContinue | Select-Object *") or [{}])[0].items()}
 
-# ───────────────────────────────────────────────────────
-#  Read Settings
-# ───────────────────────────────────────────────────────
+AFD_PATH = r"SYSTEM\CurrentControlSet\Services\AFD\Parameters"
+AFD_KEYS = [
+    "DefaultReceiveWindow","DefaultSendWindow","BufferMultiplier","BufferAlignment",
+    "DoNotHoldNicBuffers","SmallBufferSize","MediumBufferSize","LargeBufferSize",
+    "HugeBufferSize","SmallBufferListDepth","MediumBufferListDepth","LargeBufferListDepth",
+    "DisableAddressSharing","DisableChainedReceive","DisableDirectAcceptEx",
+    "DisableRawSecurity","DynamicSendBufferDisable","FastSendDatagramThreshold",
+    "FastCopyReceiveThreshold","IgnorePushBitOnReceives","IgnoreOrderlyRelease",
+    "TransmitWorker","PriorityBoost",
+]
 
-def get_rss(adapter_name: str) -> Dict[str, str]:
-    data = ps_json(f"Get-NetAdapterRss -Name '{adapter_name}' -EA SilentlyContinue | Select-Object *")
-    if not data:
-        return {}
-    r = data[0]
-    keys = ["Enabled", "NumberOfReceiveQueues", "Profile", "BaseProcessorNumber",
-            "MaxProcessorNumber", "MaxProcessors", "BaseProcessorGroup"]
-    return {k: str(r.get(k, "")) for k in keys if k in r}
+def get_afd():
+    out = {}
+    for k in AFD_KEYS:
+        v = reg_read(winreg.HKEY_LOCAL_MACHINE, AFD_PATH, k)
+        out[k] = str(v) if v is not None else ""
+    return out
 
+# ─── Write settings ───
+def set_rss(name, vals):
+    parts = " ".join(f"-{k} {v}" for k,v in vals.items() if v)
+    return ps(f"Set-NetAdapterRss -Name '{name}' {parts} -NoRestart") if parts else ""
 
-def get_global() -> Dict[str, str]:
-    data = ps_json("Get-NetOffloadGlobalSetting | Select-Object *")
-    if not data:
-        return {}
-    r = data[0]
-    keys = ["ReceiveSideScaling", "ReceiveSegmentCoalescing", "Chimney",
-            "TaskOffload", "NetworkDirect", "NetworkDirectAcrossIPSubnets",
-            "PacketCoalescingFilter"]
-    return {k: str(r.get(k, "")) for k in keys if k in r}
+def set_global(vals):
+    parts = " ".join(f"-{k} {v}" for k,v in vals.items() if v)
+    return ps(f"Set-NetOffloadGlobalSetting {parts}") if parts else ""
 
+def set_iface(name, fam, vals):
+    parts = " ".join(f"-{k} {v}" for k,v in vals.items() if v)
+    return ps(f"Set-NetIPInterface -InterfaceAlias '{name}' -AddressFamily {fam} {parts}") if parts else ""
 
-def get_interface(adapter_name: str, family: str = "IPv4") -> Dict[str, str]:
-    data = ps_json(
-        f"Get-NetIPInterface -InterfaceAlias '{adapter_name}' "
-        f"-AddressFamily {family} -EA SilentlyContinue | Select-Object *"
-    )
-    if not data:
-        return {}
-    r = data[0]
-    keys = [
-        "AdvertiseDefaultRoute", "Advertising", "AutomaticMetric", "ClampMss",
-        "DirectedMacWolPattern", "EcnMarking", "ForceArpNdWolPattern", "Forwarding",
-        "IgnoreDefaultRoutes", "ManagedAddressConfiguration", "NeighborDiscoverySupported",
-        "NeighborUnreachabilityDetection", "OtherStatefulConfiguration", "RouterDiscovery",
-        "Store", "WeakHostReceive", "WeakHostSend", "CurrentHopLimit",
-        "BaseReachableTime", "RetransmitTime", "ReachableTime",
-        "DadRetransmitTime", "DadTransmits", "NlMtu",
-    ]
-    return {k: str(r.get(k, "")) for k in keys if k in r}
+def set_adv(name, keyword, reg_value):
+    return ps(f"Set-NetAdapterAdvancedProperty -Name '{name}' -RegistryKeyword '{keyword}' -RegistryValue '{reg_value}' -NoRestart")
 
+def set_afd(key, value):
+    return reg_write_dword(winreg.HKEY_LOCAL_MACHINE, AFD_PATH, key, value)
 
-def get_afd_tweaks() -> Dict[str, str]:
-    """Read AFD parameters directly from registry (fast, no PowerShell)."""
-    path = r"SYSTEM\CurrentControlSet\Services\AFD\Parameters"
-    keys = [
-        "DefaultReceiveWindow", "DefaultSendWindow", "BufferMultiplier", "BufferAlignment",
-        "DoNotHoldNicBuffers", "SmallBufferSize", "MediumBufferSize", "LargeBufferSize",
-        "HugeBufferSize", "SmallBufferListDepth", "MediumBufferListDepth", "LargeBufferListDepth",
-        "DisableAddressSharing", "DisableChainedReceive", "DisableDirectAcceptEx",
-        "DisableRawSecurity", "DynamicSendBufferDisable", "FastSendDatagramThreshold",
-        "FastCopyReceiveThreshold", "IgnorePushBitOnReceives", "IgnoreOrderlyRelease",
-        "TransmitWorker", "PriorityBoost",
-    ]
-    result = {}
-    for k in keys:
-        val = reg_read_dword(winreg.HKEY_LOCAL_MACHINE, path, k)
-        result[k] = str(val) if val is not None else ""
-    return result
+def restart(name):
+    ps(f"Disable-NetAdapter -Name '{name}' -Confirm:$false")
+    ps(f"Enable-NetAdapter -Name '{name}' -Confirm:$false")
 
+def unlock_rss(name):
+    ps(f"Set-NetAdapterRss -Name '{name}' -NumberOfReceiveQueues (Get-NetAdapterRss -Name '{name}').IndirectionTableEntryCount -NoRestart -EA SilentlyContinue")
 
-# ───────────────────────────────────────────────────────
-#  Write Settings
-# ───────────────────────────────────────────────────────
-
-def set_rss(adapter_name: str, settings: Dict[str, str]) -> Tuple[bool, str]:
-    parts = " ".join(f"-{k} {v}" for k, v in settings.items() if v)
-    if not parts:
-        return False, "No settings"
-    out = ps(f"Set-NetAdapterRss -Name '{adapter_name}' {parts} -NoRestart")
-    return True, out or "OK"
-
-
-def set_global(settings: Dict[str, str]) -> Tuple[bool, str]:
-    parts = " ".join(f"-{k} {v}" for k, v in settings.items() if v)
-    if not parts:
-        return False, "No settings"
-    out = ps(f"Set-NetOffloadGlobalSetting {parts}")
-    return True, out or "OK"
-
-
-def set_interface(adapter_name: str, family: str, settings: Dict[str, str]) -> Tuple[bool, str]:
-    parts = " ".join(f"-{k} {v}" for k, v in settings.items() if v)
-    if not parts:
-        return False, "No settings"
-    out = ps(f"Set-NetIPInterface -InterfaceAlias '{adapter_name}' -AddressFamily {family} {parts}")
-    return True, out or "OK"
-
-
-def set_adv_property(adapter_name: str, keyword: str, reg_value: str) -> Tuple[bool, str]:
-    out = ps(
-        f"Set-NetAdapterAdvancedProperty -Name '{adapter_name}' "
-        f"-RegistryKeyword '{keyword}' -RegistryValue '{reg_value}' -NoRestart"
-    )
-    return True, out or "OK"
-
-
-def set_afd_tweak(key: str, value: int) -> bool:
-    return reg_write_dword(
-        winreg.HKEY_LOCAL_MACHINE,
-        r"SYSTEM\CurrentControlSet\Services\AFD\Parameters",
-        key, value
-    )
-
-
-def restart_adapter(adapter_name: str) -> Tuple[bool, str]:
-    ps(f"Disable-NetAdapter -Name '{adapter_name}' -Confirm:$false")
-    ps(f"Enable-NetAdapter -Name '{adapter_name}' -Confirm:$false")
-    return True, "Adapter restarted"
-
-
-def unlock_rss(adapter_name: str) -> Tuple[bool, str]:
-    ps(f"Set-NetAdapterRss -Name '{adapter_name}' "
-       f"-NumberOfReceiveQueues (Get-NetAdapterRss -Name '{adapter_name}')"
-       f".IndirectionTableEntryCount -NoRestart -EA SilentlyContinue")
-    return True, "RSS Queues unlocked"
-
-
-# ───────────────────────────────────────────────────────
-#  Presets
-# ───────────────────────────────────────────────────────
-
-PRESET_GAMING = {
-    "rss": {"Enabled": "True", "Profile": "NUMAStatic"},
-    "global": {
-        "ReceiveSideScaling": "Enabled",
-        "ReceiveSegmentCoalescing": "Disabled",
-        "Chimney": "Disabled",
-        "TaskOffload": "Disabled",
-        "NetworkDirect": "Disabled",
-        "PacketCoalescingFilter": "Disabled",
+# ─── Presets ───
+PRESETS = {
+    "gaming": {
+        "name": "Gaming (Low Latency)",
+        "desc": "Disable offloads, power saving, interrupt moderation — lowest ping",
+        "global": {"ReceiveSideScaling":"Enabled","ReceiveSegmentCoalescing":"Disabled",
+                   "Chimney":"Disabled","TaskOffload":"Disabled","NetworkDirect":"Disabled",
+                   "PacketCoalescingFilter":"Disabled"},
+        "adv": {"*FlowControl":"0","*InterruptModeration":"0","*PMARPOffload":"0",
+                "*PMNSOffload":"0","*WakeOnMagicPacket":"0","*WakeOnPattern":"0",
+                "WakeOnLink":"0","*EEE":"0","EnableGreenEthernet":"0",
+                "ReduceSpeedOnPowerDown":"0","*PMAPowerManagement":"0",
+                "AutoPowerSaveModeEnabled":"0","NicAutoPowerSaver":"0"},
+        "afd": {"DefaultReceiveWindow":512,"DefaultSendWindow":512,"BufferMultiplier":1,
+                "DynamicSendBufferDisable":0,"IgnorePushBitOnReceives":1},
     },
-    "adv": {
-        "*FlowControl": "0",           # Disabled
-        "*InterruptModeration": "0",    # Disabled
-        "*PMARPOffload": "0",           # Disabled
-        "*PMNSOffload": "0",            # Disabled
-        "*WakeOnMagicPacket": "0",
-        "*WakeOnPattern": "0",
-        "WakeOnLink": "0",
-        "*EEE": "0",
-        "EnableGreenEthernet": "0",
-        "ReduceSpeedOnPowerDown": "0",
-        "*PMAPowerManagement": "0",
-        "AutoPowerSaveModeEnabled": "0",
-        "NicAutoPowerSaver": "0",
+    "streaming": {
+        "name": "Streaming (High Throughput)",
+        "desc": "Maximize bandwidth — enable offloads, large buffers",
+        "global": {"ReceiveSideScaling":"Enabled","ReceiveSegmentCoalescing":"Enabled",
+                   "TaskOffload":"Enabled","PacketCoalescingFilter":"Enabled"},
+        "adv": {"*FlowControl":"3","*InterruptModeration":"1",
+                "*LsoV2IPv4":"1","*LsoV2IPv6":"1"},
+        "afd": {"DefaultReceiveWindow":65535,"DefaultSendWindow":65535},
     },
-    "tweaks": {
-        "DefaultReceiveWindow": 512,
-        "DefaultSendWindow": 512,
-        "BufferMultiplier": 1,
-        "DynamicSendBufferDisable": 0,
-        "IgnorePushBitOnReceives": 1,
+    "default": {
+        "name": "Windows Default",
+        "desc": "Reset to Windows default values",
+        "global": {"ReceiveSideScaling":"Enabled","ReceiveSegmentCoalescing":"Enabled",
+                   "Chimney":"Disabled","TaskOffload":"Enabled","NetworkDirect":"Enabled",
+                   "PacketCoalescingFilter":"Enabled"},
+        "adv": {"*FlowControl":"3","*InterruptModeration":"1"},
     },
 }
 
-PRESET_DEFAULT = {
-    "global": {
-        "ReceiveSideScaling": "Enabled",
-        "ReceiveSegmentCoalescing": "Enabled",
-        "Chimney": "Disabled",
-        "TaskOffload": "Enabled",
-        "NetworkDirect": "Enabled",
-        "PacketCoalescingFilter": "Enabled",
-    },
-    "adv": {
-        "*FlowControl": "3",
-        "*InterruptModeration": "1",
-    },
-}
-
-
-def apply_preset(adapter_name: str, preset: dict) -> List[str]:
-    """Apply a preset, return list of results."""
+def apply_preset(name, preset_key):
+    p = PRESETS[preset_key]
     results = []
-    if "rss" in preset:
-        ok, msg = set_rss(adapter_name, preset["rss"])
-        results.append(f"RSS: {msg}")
-    if "global" in preset:
-        ok, msg = set_global(preset["global"])
-        results.append(f"Global: {msg}")
-    if "adv" in preset:
-        for kw, val in preset["adv"].items():
-            ok, msg = set_adv_property(adapter_name, kw, val)
-            results.append(f"Adv {kw}: {msg}")
-    if "tweaks" in preset:
-        for k, v in preset["tweaks"].items():
-            ok = set_afd_tweak(k, v)
-            results.append(f"Tweak {k}: {'OK' if ok else 'FAIL'}")
+    if "global" in p: set_global(p["global"]); results.append("Global")
+    if "adv" in p:
+        for kw,v in p["adv"].items(): set_adv(name, kw, v)
+        results.append(f"Adv({len(p['adv'])})")
+    if "afd" in p:
+        for k,v in p["afd"].items(): set_afd(k, v)
+        results.append(f"AFD({len(p['afd'])})")
     return results
 
+# ─── Export / Import ───
+def export_all(name, filepath):
+    data = {"_meta":{"adapter":name,"exported":datetime.now().isoformat(),"tool":"NATweaker"},
+            "rss":get_rss(name),"global":get_global(),
+            "iface_v4":get_iface(name,"IPv4"),"iface_v6":get_iface(name,"IPv6"),
+            "adv":{p.keyword:{"display":p.display_value,"reg":p.reg_value} for p in get_adv_props(name)},
+            "afd":get_afd()}
+    with open(filepath,"w",encoding="utf-8") as f: json.dump(data,f,indent=2,ensure_ascii=False)
 
-# ───────────────────────────────────────────────────────
-#  Export / Import
-# ───────────────────────────────────────────────────────
-
-def export_settings(adapter_name: str, filepath: str) -> bool:
-    """Export all current settings to JSON."""
-    data = {
-        "adapter": adapter_name,
-        "rss": get_rss(adapter_name),
-        "global": get_global(),
-        "interface_v4": get_interface(adapter_name, "IPv4"),
-        "interface_v6": get_interface(adapter_name, "IPv6"),
-        "adv": {p.keyword: {"value": p.display_value, "reg": p.reg_value}
-                for p in get_adv_properties(adapter_name)},
-        "tweaks": get_afd_tweaks(),
-    }
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception as e:
-        log.error("Export failed: %s", e)
-        return False
-
-
-def import_settings(adapter_name: str, filepath: str) -> List[str]:
-    """Import settings from JSON and apply."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        return [f"Import failed: {e}"]
-
-    results = []
-    if "rss" in data:
-        ok, msg = set_rss(adapter_name, data["rss"])
-        results.append(f"RSS: {msg}")
-    if "global" in data:
-        ok, msg = set_global(data["global"])
-        results.append(f"Global: {msg}")
+def import_all(name, filepath):
+    with open(filepath,"r",encoding="utf-8") as f: data=json.load(f)
+    n=0
+    if "global" in data: set_global(data["global"]); n+=1
     if "adv" in data:
-        for kw, info in data["adv"].items():
-            reg_val = info.get("reg", info.get("value", ""))
-            if reg_val:
-                ok, msg = set_adv_property(adapter_name, kw, reg_val)
-                results.append(f"Adv {kw}: {msg}")
-    if "tweaks" in data:
-        for k, v in data["tweaks"].items():
+        for kw,info in data["adv"].items():
+            rv=info.get("reg",info.get("display",""))
+            if rv: set_adv(name,kw,rv); n+=1
+    if "afd" in data:
+        for k,v in data["afd"].items():
             if v:
-                ok = set_afd_tweak(k, int(v))
-                results.append(f"Tweak {k}: {'OK' if ok else 'FAIL'}")
-    return results
+                try: set_afd(k,int(v)); n+=1
+                except: pass
+    return n
+
+# ─── Auto backup ───
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+
+def auto_backup(name):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(BACKUP_DIR, f"{name}_{ts}.json")
+    export_all(name, path)
+    return path
+
+# ─── Network stats (live) ───
+def get_net_stats(name):
+    data = ps_json(f"Get-NetAdapterStatistics -Name '{name}' -EA SilentlyContinue | Select-Object *")
+    if not data: return {}
+    d = data[0]
+    return {
+        "rx_bytes": d.get("ReceivedBytes",0), "tx_bytes": d.get("SentBytes",0),
+        "rx_pkts": d.get("ReceivedUnicastPackets",0), "tx_pkts": d.get("SentUnicastPackets",0),
+        "rx_errs": d.get("ReceivedPacketErrors",0), "tx_errs": d.get("OutboundPacketErrors",0),
+        "rx_disc": d.get("ReceivedDiscards",0), "tx_disc": d.get("OutboundDiscards",0),
+    }

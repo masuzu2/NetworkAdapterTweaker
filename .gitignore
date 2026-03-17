@@ -4,8 +4,8 @@ dist/
 *.exe
 *.pyc
 __pycache__/
+backups/
 .vs/
 node_modules/
-package-lock.json
-*.obj
-*.pdb
+src/
+CMakeLists.txt
