@@ -1,0 +1,14 @@
+build/
+*.exe
+*.obj
+*.pdb
+*.ilk
+.vs/
+CMakeSettings.json
+out/
+x64/
+Debug/
+Release/
+node_modules/
+package-lock.json
+main.js
